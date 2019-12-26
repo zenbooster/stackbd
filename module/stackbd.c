@@ -15,6 +15,7 @@
 
 #include <trace/events/block.h>
 
+#include "logging.h"
 #include "../common/stackbd.h"
 
 #define STACKBD_BDEV_MODE (FMODE_READ | FMODE_WRITE | FMODE_EXCL)
@@ -23,17 +24,20 @@
  * We can tweak our hardware sector size, but the kernel talks to us
  * in terms of small sectors, always.
  */
-#define KERNEL_SECTOR_SIZE 512
+#define KERNEL_SECTOR_SHIFT 9
+#define KERNEL_SECTOR_SIZE (1 << KERNEL_SECTOR_SHIFT)
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
 #   define DECLARE_BIO_VEC struct bio_vec
 #   define ACCESS_BIO_VEC(x) (x)
+#	define DECLARE_BVEC_ITER struct bvec_iter
 #	define BIO_SET_SECTOR(bio, sec) (bio)->bi_iter.bi_sector = (sec)
 #	define BIO_GET_SECTOR(bio) (bio)->bi_iter.bi_sector
 #	define BIO_GET_SIZE(bio) (bio)->bi_iter.bi_size
 #else
 #   define DECLARE_BIO_VEC struct bio_vec *
 #   define ACCESS_BIO_VEC(x) (*(x))
+#	define DECLARE_BVEC_ITER int
 #	define BIO_SET_SECTOR(bio, sec) (bio)->bi_sector = (sec)
 #	define BIO_GET_SECTOR(bio) (bio)->bi_sector
 #	define BIO_GET_SIZE(bio) (bio)->bi_size
@@ -54,6 +58,9 @@ static int major_num = 0;
 module_param(major_num, int, 0);
 static int LOGICAL_BLOCK_SIZE = 512;
 module_param(LOGICAL_BLOCK_SIZE, int, 0);
+//static bool is_remap = true;
+static bool is_remap = false;
+module_param(is_remap, bool, 0);
 
 /*
  * The internal representation of our device.
@@ -72,7 +79,156 @@ static struct stackbd_t {
 
 static DECLARE_WAIT_QUEUE_HEAD(req_event);
 
-static void stackbd_io_fn(struct bio *bio)
+typedef void (* t_stackbd_io_fn)(struct bio *);
+static t_stackbd_io_fn p_stackbd_io_fn = NULL;
+
+int buffer_read(
+	struct stackbd_t *dev,
+    unsigned long sector,
+    unsigned long nsect,
+    char *buffer
+)
+{
+    int result = 0;
+    unsigned nsize = nsect << KERNEL_SECTOR_SHIFT;
+    int npages = ((nsize - 1) >> PAGE_SHIFT) + 1;
+    struct bio *bio;
+    struct block_device *bdev = dev->bdev_raw;
+
+    PINFO("begin; sector=%ld; nsect=%ld; buffer=%p\n", sector, nsect, buffer);
+
+    /*if(unlikely(!dev->is_bdev_raw_ok))
+    {
+        PINFO("bdev is NULL!\n");
+        result = -EFAULT;
+        goto out;
+    }*/
+
+    bio = bio_alloc(GFP_NOIO, npages);
+
+    if(unlikely(!bio))
+    {
+        PINFO("bio_alloc failed!\n");
+        result = -ENOMEM;
+        goto out;
+    }
+
+    BIO_SET_BDEV(bio, bdev);
+    BIO_SET_SECTOR(bio, sector);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+    bio_set_op_attrs(bio, REQ_OP_READ, REQ_PREFLUSH);
+#endif
+    {
+        char *ptr = buffer;
+        do
+        {
+            struct page *page;
+            page = virt_to_page(ptr);
+            if(unlikely(!page))
+            {
+                PINFO("virt_to_page failed!\n");
+                result = -ENOMEM;
+                break;
+            }
+
+            {
+                unsigned op = offset_in_page(ptr);
+                unsigned this_step = min((unsigned)(PAGE_SIZE - op), nsize);
+                bio_add_page(bio, page, this_step, op);
+                nsize -= this_step;
+                ptr += this_step;
+            }
+        } while(nsize > 0);
+
+        if(likely(!result))
+        {
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+            result = submit_bio_wait(bio);
+	#else
+            result = submit_bio_wait(READ | REQ_FLUSH, bio);
+	#endif
+        }
+        bio_put(bio);
+    }
+out:
+    PINFO("end (%d)\n", result);
+    return result;
+}
+
+int buffer_write(
+	struct stackbd_t *dev,
+    unsigned long sector,
+    unsigned long nsect,
+    char *buffer
+)
+{
+    int result = 0;
+    unsigned nsize = nsect << KERNEL_SECTOR_SHIFT;
+    int npages = ((nsize - 1) >> PAGE_SHIFT) + 1;
+    struct bio *bio;
+    struct block_device *bdev = dev->bdev_raw;
+
+    PINFO("begin; sector=%ld; nsect=%ld; buffer=%p\n", sector, nsect, buffer);
+
+    /*if(unlikely(!dev->is_bdev_raw_ok))
+    {
+        PINFO("bdev is NULL!\n");
+        result = -EFAULT;
+        goto out;
+    }*/
+
+    bio = bio_alloc(GFP_NOIO, npages);
+    if(unlikely(!bio))
+    {
+        PINFO("bio_alloc failed!\n");
+        result = -ENOMEM;
+        goto out;
+    }
+    BIO_SET_BDEV(bio, bdev);
+    BIO_SET_SECTOR(bio, sector);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+    bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_PREFLUSH);
+#endif
+    {
+        char *ptr = buffer;
+        do
+        {
+            struct page *page = virt_to_page(ptr);
+
+            if(unlikely(!page))
+            {
+                PINFO("alloc page failed!\n");
+                result = -ENOMEM;
+                break;
+            }
+
+            {
+                unsigned op = offset_in_page(ptr);
+                unsigned this_step = min((unsigned)(PAGE_SIZE - op), nsize);
+                bio_add_page(bio, page, this_step, op);
+                nsize -= this_step;
+                ptr += this_step;
+            }
+        } while(nsize > 0);
+
+        if(likely(!result))
+        {
+	#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
+            result = submit_bio_wait(bio);
+	#else
+            result = submit_bio_wait(WRITE | REQ_FLUSH, bio);
+	#endif
+        }
+        bio_put(bio);
+    }
+out:
+    PINFO("end (%d)\n", result);
+    return result;
+}
+
+static void stackbd_io_fn_remap(struct bio *bio)
 {
 //    printk("stackdb: Mapping sector: %llu -> %llu, dev: %s -> %s\n",
 //            bio->bi_sector,
@@ -84,11 +240,57 @@ static void stackbd_io_fn(struct bio *bio)
 //        bio->bi_sector = lba;
     BIO_SET_BDEV(bio, stackbd.bdev_raw);
 
-    trace_block_bio_remap(bdev_get_queue(stackbd.bdev_raw), bio,
+   	trace_block_bio_remap(bdev_get_queue(stackbd.bdev_raw), bio,
     		stackbd.bdev_raw->bd_dev, BIO_GET_SECTOR(bio));
 
     /* No need to call bio_endio() */
     generic_make_request(bio);
+}
+
+static void my_bio_complete(struct bio *bio, int ret)
+{
+    bio_endio(bio
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 3, 0)
+    , ret
+#endif
+    );
+}
+
+static void stackbd_io_fn_clone(struct bio *bio)
+{
+    DECLARE_BIO_VEC bvec;
+    DECLARE_BVEC_ITER iter;
+    sector_t sector = BIO_GET_SECTOR(bio);
+    int size = BIO_GET_SIZE(bio);
+    int nsect = size >> KERNEL_SECTOR_SHIFT;
+
+	char *src = kmalloc(size, GFP_KERNEL);
+	char *p = src;
+
+	if (bio_data_dir(bio) == READ)
+	{
+		buffer_read(&stackbd, sector, nsect, src);
+		bio_for_each_segment(bvec, bio, iter)
+		{
+			char *dst = page_address(ACCESS_BIO_VEC(bvec).bv_page) + ACCESS_BIO_VEC(bvec).bv_offset;
+			int len = ACCESS_BIO_VEC(bvec).bv_len;
+			memcpy(dst, p, len);
+			p += len;
+		}
+	}
+	else
+	{
+		bio_for_each_segment(bvec, bio, iter)
+		{
+			char *dst = page_address(ACCESS_BIO_VEC(bvec).bv_page) + ACCESS_BIO_VEC(bvec).bv_offset;
+			int len = ACCESS_BIO_VEC(bvec).bv_len;
+			memcpy(p, dst, len);
+			p += len;
+		}
+		buffer_write(&stackbd, sector, nsect, src);
+	}
+	kfree(src);
+    my_bio_complete(bio, 0);
 }
 
 static int stackbd_threadfn(void *data)
@@ -113,7 +315,7 @@ static int stackbd_threadfn(void *data)
         bio = bio_list_pop(&stackbd.bio_list);
         spin_unlock_irq(&stackbd.lock);
 
-        stackbd_io_fn(bio);
+        p_stackbd_io_fn(bio);
     }
 
     return 0;
@@ -287,6 +489,8 @@ static struct block_device_operations stackbd_ops = {
 
 static int __init stackbd_init(void)
 {
+	p_stackbd_io_fn = is_remap ? stackbd_io_fn_remap : stackbd_io_fn_clone;
+
 	/* Set up our internal device */
 	spin_lock_init(&stackbd.lock);
 
