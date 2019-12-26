@@ -2,6 +2,7 @@
 #include <linux/moduleparam.h>
 #include <linux/init.h>
 
+#include <linux/version.h>
 #include <linux/kernel.h> /* printk() */
 #include <linux/fs.h>     /* everything... */
 #include <linux/errno.h>  /* error codes */
@@ -24,6 +25,28 @@
  */
 #define KERNEL_SECTOR_SIZE 512
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 14, 0)
+#   define DECLARE_BIO_VEC struct bio_vec
+#   define ACCESS_BIO_VEC(x) (x)
+#	define BIO_SET_SECTOR(bio, sec) (bio)->bi_iter.bi_sector = (sec)
+#	define BIO_GET_SECTOR(bio) (bio)->bi_iter.bi_sector
+#	define BIO_GET_SIZE(bio) (bio)->bi_iter.bi_size
+#else
+#   define DECLARE_BIO_VEC struct bio_vec *
+#   define ACCESS_BIO_VEC(x) (*(x))
+#	define BIO_SET_SECTOR(bio, sec) (bio)->bi_sector = (sec)
+#	define BIO_GET_SECTOR(bio) (bio)->bi_sector
+#	define BIO_GET_SIZE(bio) (bio)->bi_size
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0)
+#	define BIO_SET_BDEV(bio, bdev) bio_set_dev((bio), (bdev));
+#else
+#	define BIO_SET_BDEV(bio, bdev) (bio)->bi_bdev = (bdev);
+#endif
+
+static const char *sec_fmt = (sizeof(sector_t) == sizeof(long long unsigned int)) ? "llu" : "lu";
+static const int sec_fmt_size = sizeof(sec_fmt) / sizeof(sec_fmt[0]);
 
 MODULE_LICENSE("Dual BSD/GPL");
 
@@ -59,10 +82,10 @@ static void stackbd_io_fn(struct bio *bio)
 //
 //    if (lba != EMPTY_REAL_LBA)
 //        bio->bi_sector = lba;
-    bio->bi_bdev = stackbd.bdev_raw;
+    BIO_SET_BDEV(bio, stackbd.bdev_raw);
 
     trace_block_bio_remap(bdev_get_queue(stackbd.bdev_raw), bio,
-            bio->bi_bdev->bd_dev, bio->bi_sector);
+    		stackbd.bdev_raw->bd_dev, BIO_GET_SECTOR(bio));
 
     /* No need to call bio_endio() */
     generic_make_request(bio);
@@ -99,11 +122,19 @@ static int stackbd_threadfn(void *data)
 /*
  * Handle an I/O request.
  */
-static void stackbd_make_request(struct request_queue *q, struct bio *bio)
+static
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+blk_qc_t
+#else
+void
+#endif
+stackbd_make_request(struct request_queue *q, struct bio *bio)
 {
-    printk("stackbd: make request %-5s block %-12llu #pages %-4hu total-size "
-            "%-10u\n", bio_data_dir(bio) == WRITE ? "write" : "read",
-            bio->bi_sector, bio->bi_vcnt, bio->bi_size);
+	const char mfmt[] = "stackbd: make request %%-5s block %%-12%s #pages %%-4hu total-size %%-10u\n";
+	char fmt[ARRAY_SIZE(mfmt)-4-2+sec_fmt_size];
+	sprintf(fmt, mfmt, sec_fmt);
+    printk(fmt, bio_data_dir(bio) == WRITE ? "write" : "read",
+            BIO_GET_SECTOR(bio), bio->bi_vcnt, BIO_GET_SIZE(bio));
 
 //    printk("<%p> Make request %s %s %s\n", bio,
 //           bio->bi_rw & REQ_SYNC ? "SYNC" : "",
@@ -125,12 +156,16 @@ static void stackbd_make_request(struct request_queue *q, struct bio *bio)
     wake_up(&req_event);
     spin_unlock_irq(&stackbd.lock);
 
-    return;
+    goto exit;
 
 abort:
     spin_unlock_irq(&stackbd.lock);
     printk("<%p> Abort request\n\n", bio);
     bio_io_error(bio);
+exit:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 0)
+    return BLK_QC_T_NONE;
+#endif
 }
 
 static struct block_device *stackbd_bdev_open(char dev_path[])
@@ -164,13 +199,16 @@ static struct block_device *stackbd_bdev_open(char dev_path[])
 static int stackbd_start(char dev_path[])
 {
     unsigned max_sectors;
+	const char mfmt[] = "stackbd: Device real capacity: %%%s\n";
+	char fmt[ARRAY_SIZE(mfmt)-1-2+sec_fmt_size];
+	sprintf(fmt, mfmt, sec_fmt);
 
     if (!(stackbd.bdev_raw = stackbd_bdev_open(dev_path)))
         return -EFAULT;
 
     /* Set up our internal device */
     stackbd.capacity = get_capacity(stackbd.bdev_raw->bd_disk);
-    printk("stackbd: Device real capacity: %llu\n", stackbd.capacity);
+    printk(fmt, stackbd.capacity);
 
     set_capacity(stackbd.gd, stackbd.capacity);
 
